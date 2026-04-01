@@ -16,4 +16,5 @@ jobs:
     permissions:
       contents: read
 
-    steps: []
+    steps:
+      - run: echo works
