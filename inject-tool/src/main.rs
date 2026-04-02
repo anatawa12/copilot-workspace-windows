@@ -15,7 +15,7 @@ use std::mem::{offset_of, size_of};
 // derived from the canonical Windows SDK layout rather than hardcoded numbers.
 use windows_sys::Win32::System::Diagnostics::Debug::{
     IMAGE_DATA_DIRECTORY, IMAGE_FILE_HEADER, IMAGE_OPTIONAL_HEADER32, IMAGE_SECTION_HEADER,
-    IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
+    IMAGE_NT_OPTIONAL_HDR32_MAGIC,
 };
 use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_I386;
 use windows_sys::Win32::System::SystemServices::{
@@ -114,7 +114,6 @@ struct Pe {
     entry_rva: u32,
     sec_align: u32,
     file_align: u32,
-    size_of_image: u32,
     size_of_headers: u32,
 
     sections: Vec<Sec>,
@@ -126,6 +125,7 @@ struct Sec {
     virtual_address: u32,
     raw_size: u32,
     raw_ptr: u32,
+    characteristics: u32,
 }
 
 impl Sec {
@@ -178,7 +178,6 @@ impl Pe {
         let image_base = oh_s.ImageBase;
         let sec_align = oh_s.SectionAlignment;
         let file_align = oh_s.FileAlignment;
-        let size_of_image = oh_s.SizeOfImage;
         let size_of_headers = oh_s.SizeOfHeaders;
 
         //  Section headers 
@@ -194,6 +193,7 @@ impl Pe {
                 virtual_address: sec.VirtualAddress,
                 raw_size: sec.SizeOfRawData,
                 raw_ptr: sec.PointerToRawData,
+                characteristics: sec.Characteristics,
             });
         }
 
@@ -205,7 +205,6 @@ impl Pe {
             entry_rva,
             sec_align,
             file_align,
-            size_of_image,
             size_of_headers,
             sections,
         })
@@ -486,15 +485,14 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     let original_entry_rva = exe_pe.entry_rva;
     let dll_image_base = dll_pe.image_base;
     let dll_entry_rva = dll_pe.entry_rva;
-    let dll_img_size = dll_pe.size_of_image as usize;
 
-    //  Collect imports ─
+    //  Collect imports
     let exe_imports = read_exe_imports(exe_data, &exe_pe)
         .map_err(|e| format!("reading EXE imports: {}", e))?;
     let dll_imports = read_dll_imports(dll_data, &dll_pe)
         .map_err(|e| format!("reading DLL imports: {}", e))?;
 
-    //  Validate: every DLL import must exist in the EXE 
+    //  Validate: every DLL import must exist in the EXE
     for (dll_name, func_name, _iat_rva) in &dll_imports {
         if !exe_imports.contains_key(&(dll_name.clone(), func_name.clone())) {
             return Err(format!(
@@ -504,51 +502,102 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
 
-    //  Find inner_entry 
+    //  Find inner_entry
     let inner_entry_rva = find_inner_entry(dll_data, &dll_pe)?;
 
-    //  Build the DLL in-memory image 
-    let mut dll_image = vec![0u8; dll_img_size];
+    //  Build embedded-section list ─
+    //
+    // Each non-.reloc DLL section becomes a separate EXE section placed at
+    //   VirtualAddress = new_rva + dll_sec.virtual_address
+    // so the original DLL inter-section gaps are preserved in virtual space.
+    //
+    // The Windows PE loader requires sections to be virtually contiguous
+    // (no unmapped gap  SectionAlignment between consecutive sections).
+    // We insert BSS "gap-filler" entries to satisfy this wherever needed:
+    // before the first DLL section and between any non-contiguous pair.
+    //
+    // The .reloc section is excluded  its data was consumed during the
+    // relocation pass below and is not needed at run time.
 
-    // Copy PE headers
-    let hdr_len = (dll_pe.size_of_headers as usize).min(dll_data.len()).min(dll_img_size);
-    dll_image[..hdr_len].copy_from_slice(&dll_data[..hdr_len]);
-
-    // Copy each section into its virtual address slot
-    for sec in &dll_pe.sections {
-        if sec.raw_size == 0 {
-            continue;
-        }
-        let src_start = sec.raw_ptr as usize;
-        let copy_len = sec.raw_size as usize;
-        let dst_start = sec.virtual_address as usize;
-
-        if src_start + copy_len > dll_data.len() {
-            return Err(format!(
-                "DLL section '{}' raw data (0x{:X}+0x{:X}) exceeds file size",
-                std::str::from_utf8(&sec.name).unwrap_or("?"),
-                src_start,
-                copy_len
-            ));
-        }
-        if dst_start + copy_len > dll_img_size {
-            return Err(format!(
-                "DLL section '{}' virtual range exceeds SizeOfImage",
-                std::str::from_utf8(&sec.name).unwrap_or("?")
-            ));
-        }
-        dll_image[dst_start..dst_start + copy_len]
-            .copy_from_slice(&dll_data[src_start..src_start + copy_len]);
-    }
-
-    //  Compute new section placement in EXE 
+    //  Compute new section placement in EXE ─
     let last = exe_pe.sections.last().ok_or("EXE has no sections")?;
-
     let new_rva = align_up(last.end_rva(), exe_pe.sec_align);
     let new_raw = align_up(last.raw_ptr + last.raw_size, exe_pe.file_align);
 
-    //  Apply DLL base relocations and redirect IAT references
-    // The DLL will reside at virtual address: exe_image_base + new_rva
+    // IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
+    const FILLER_CHAR: u32 = 0x40000040;
+
+    struct EmbedEntry {
+        name: [u8; 8],
+        virt_addr: u32,        // VirtualAddress in the output EXE
+        virt_size: u32,        // VirtualSize in the section header
+        characteristics: u32,
+        buf: Vec<u8>,          // raw data; empty for BSS gap-fillers
+        dll_sec_idx: Option<usize>, // None for gap-fillers
+    }
+
+    let mut entries: Vec<EmbedEntry> = Vec::new();
+    // cur_dll_va: section-aligned virtual end of the last processed DLL section,
+    // relative to the DLL image base (starts at 0 = "before first section").
+    let mut cur_dll_va: u32 = 0;
+
+    for (i, s) in dll_pe.sections.iter().enumerate() {
+        let name_end = s.name.iter().position(|&b| b == 0).unwrap_or(s.name.len());
+        if &s.name[..name_end] == b".reloc" {
+            continue;
+        }
+
+        // If there is a virtual gap before this section, insert a BSS filler so
+        // that the loader sees a contiguous virtual address range.
+        if s.virtual_address > cur_dll_va {
+            let gap = s.virtual_address - cur_dll_va;
+            entries.push(EmbedEntry {
+                name: *b".fll\0\0\0\0",
+                virt_addr: new_rva + cur_dll_va,
+                virt_size: gap,
+                characteristics: FILLER_CHAR,
+                buf: Vec::new(),
+                dll_sec_idx: None,
+            });
+        }
+
+        // Load raw bytes; pad to virtual extent for any zero-fill within the section.
+        let vsize = s.virtual_size.max(s.raw_size);
+        let buf = if s.raw_size > 0 {
+            let src = s.raw_ptr as usize;
+            let copy = (s.raw_size as usize).min(vsize as usize);
+            if src + copy > dll_data.len() {
+                return Err(format!(
+                    "DLL section '{}' raw data (0x{:X}+0x{:X}) exceeds file size",
+                    std::str::from_utf8(&s.name).unwrap_or("?"),
+                    src,
+                    s.raw_size
+                ));
+            }
+            let mut b = vec![0u8; vsize as usize];
+            b[..copy].copy_from_slice(&dll_data[src..src + copy]);
+            b
+        } else {
+            // BSS section: no raw data in file, loader zero-initialises from VirtualSize.
+            Vec::new()
+        };
+
+        entries.push(EmbedEntry {
+            name: s.name,
+            virt_addr: new_rva + s.virtual_address,
+            virt_size: vsize,
+            characteristics: s.characteristics,
+            buf,
+            dll_sec_idx: Some(i),
+        });
+
+        // Advance the expected-VA pointer: section-aligned end of this section.
+        cur_dll_va = align_up(s.virtual_address + vsize, exe_pe.sec_align);
+    }
+
+    //  Apply DLL base relocations and redirect IAT references 
+    // All DLL sections reside at exe_image_base + new_rva + dll_sec.virtual_address.
+    // The relocation delta is uniform across all sections.
     let load_base = exe_pe.image_base.wrapping_add(new_rva);
     let delta = (load_base as i64) - (dll_image_base as i64);
 
@@ -602,25 +651,32 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
 
                     if rel_type == IMAGE_REL_BASED_HIGHLOW {
                         let target_rva = blk.VirtualAddress + offset;
-                        let idx = target_rva as usize;
-                        if idx + 4 > dll_image.len() {
-                            return Err(format!(
-                                "relocation target RVA 0x{:08X} out of DLL image",
-                                target_rva
-                            ));
+                        // Find which real (non-filler) section buffer contains this RVA.
+                        // Relocations targeting skipped sections (e.g. .reloc self-
+                        // references) are harmless to ignore.
+                        let found = entries.iter_mut().find_map(|e| {
+                            let sec_idx = e.dll_sec_idx?;
+                            let s = &dll_pe.sections[sec_idx];
+                            let va = s.virtual_address;
+                            let len = s.virtual_size.max(s.raw_size) as usize;
+                            if target_rva >= va && (target_rva - va) as usize + 4 <= len {
+                                Some((&mut e.buf, (target_rva - va) as usize))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((buf, off)) = found {
+                            let old = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                            // If this absolute address references a DLL IAT slot,
+                            // replace it with the corresponding EXE IAT VA.
+                            // Otherwise apply the standard load-time delta.
+                            let new_val = if let Some(&exe_iat_va) = iat_redirect.get(&old) {
+                                exe_iat_va
+                            } else {
+                                (old as i64 + delta) as u32
+                            };
+                            buf[off..off + 4].copy_from_slice(&new_val.to_le_bytes());
                         }
-                        let old = u32::from_le_bytes(
-                            dll_image[idx..idx + 4].try_into().unwrap(),
-                        );
-                        // If this absolute address references a DLL IAT slot,
-                        // replace it with the corresponding EXE IAT VA.
-                        // Otherwise apply the standard load-time delta.
-                        let new_val = if let Some(&exe_iat_va) = iat_redirect.get(&old) {
-                            exe_iat_va
-                        } else {
-                            (old as i64 + delta) as u32
-                        };
-                        dll_image[idx..idx + 4].copy_from_slice(&new_val.to_le_bytes());
                     }
                 }
                 pos += blk.SizeOfBlock as usize;
@@ -628,91 +684,123 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
 
-    //  Disable the embedded DLL's import directory ─
-    // Zero out DataDirectory[IMPORT] in the in-memory DLL header so that the
-    // Windows loader does not process the embedded DLL's imports as part of the
-    // outer EXE.
-    let imp_dir_off = dll_pe.oh
-        + offset_of!(IMAGE_OPTIONAL_HEADER32, DataDirectory)
-        + DDIR_IMPORT * size_of::<IMAGE_DATA_DIRECTORY>();
-    if imp_dir_off + size_of::<IMAGE_DATA_DIRECTORY>() <= dll_image.len() {
-        dll_image[imp_dir_off..imp_dir_off + size_of::<IMAGE_DATA_DIRECTORY>()].fill(0);
-    }
-
     //  Patch inner_entry with the original EXE entry VA 
     let orig_entry_va = exe_pe.image_base.wrapping_add(original_entry_rva);
-    let idx = inner_entry_rva as usize;
-    if idx + 4 > dll_image.len() {
-        return Err(format!(
-            "inner_entry RVA 0x{:08X} out of DLL image",
+    let found_entry = entries.iter_mut().find_map(|e| {
+        let sec_idx = e.dll_sec_idx?;
+        let s = &dll_pe.sections[sec_idx];
+        let va = s.virtual_address;
+        let len = s.virtual_size.max(s.raw_size) as usize;
+        if inner_entry_rva >= va && (inner_entry_rva - va) as usize + 4 <= len {
+            Some((&mut e.buf, (inner_entry_rva - va) as usize))
+        } else {
+            None
+        }
+    });
+    match found_entry {
+        Some((buf, off)) => buf[off..off + 4].copy_from_slice(&orig_entry_va.to_le_bytes()),
+        None => return Err(format!(
+            "inner_entry RVA 0x{:08X} not found in any embedded section",
             inner_entry_rva
-        ));
+        )),
     }
-    dll_image[idx..idx + 4].copy_from_slice(&orig_entry_va.to_le_bytes());
 
-    //  Verify space for new section header ─
+    //  Verify space for new section headers 
+    let num_new_secs = entries.len();
     let sec_hdr_sz = size_of::<IMAGE_SECTION_HEADER>();
     let new_sh_off = exe_pe.shdrs_base() + exe_pe.sections.len() * sec_hdr_sz;
-    if new_sh_off + sec_hdr_sz > exe_pe.size_of_headers as usize {
+    if new_sh_off + num_new_secs * sec_hdr_sz > exe_pe.size_of_headers as usize {
         return Err(format!(
-            "no room for new section header: end of new header would be at 0x{:X}, \
-             but SizeOfHeaders = 0x{:X}",
-            new_sh_off + sec_hdr_sz,
+            "no room for {} new section headers: need 0x{:X} bytes but SizeOfHeaders = 0x{:X}",
+            num_new_secs,
+            new_sh_off + num_new_secs * sec_hdr_sz,
             exe_pe.size_of_headers
         ));
     }
 
-    //  Build the output file ─
-    let patch_content_size = dll_img_size;
-    let raw_size_aligned = align_up(patch_content_size as u32, exe_pe.file_align);
-    let required_len = new_raw as usize + raw_size_aligned as usize;
-    let mut out = exe_data.to_vec();
-    if required_len > out.len() {
-        out.resize(required_len, 0);
+    //  Compute file placements for each embedded section 
+    // VirtualAddress = new_rva + dll_sec.virtual_address (preserves inter-section gaps).
+    // PointerToRawData is packed consecutively in the file (no gap bytes on disk).
+    // Sections with no raw data (BSS/filler) use SizeOfRawData = 0 and PointerToRawData = 0.
+    let mut sec_placements: Vec<(u32, u32)> = Vec::new(); // (raw_ptr, raw_size_aligned)
+    let mut cur_raw = new_raw;
+    for entry in &entries {
+        let (raw_ptr, raw_size_aligned) = if entry.buf.is_empty() {
+            (0u32, 0u32)
+        } else {
+            let aligned = align_up(entry.buf.len() as u32, exe_pe.file_align);
+            let ptr = cur_raw;
+            cur_raw += aligned;
+            (ptr, aligned)
+        };
+        sec_placements.push((raw_ptr, raw_size_aligned));
     }
 
-    // Write DLL memory image into the new section's raw data area
-    out[new_raw as usize..new_raw as usize + dll_img_size].copy_from_slice(&dll_image);
+    //  Build the output file 
+    let mut out = exe_data.to_vec();
+    if cur_raw as usize > out.len() {
+        out.resize(cur_raw as usize, 0);
+    }
+
+    // Write each section's raw data into the output file.
+    for (entry, &(raw_ptr, _)) in entries.iter().zip(sec_placements.iter()) {
+        if !entry.buf.is_empty() {
+            let start = raw_ptr as usize;
+            out[start..start + entry.buf.len()].copy_from_slice(&entry.buf);
+        }
+    }
+
     //  Update EXE headers 
 
-    // New entry point: DLL entry within the new section
+    // New entry point: DLL entry within the new section region.
     w32(
         &mut out,
         exe_pe.oh + offset_of!(IMAGE_OPTIONAL_HEADER32, AddressOfEntryPoint),
         new_rva + dll_entry_rva,
     );
 
-    // New SizeOfImage
-    let new_size_of_image = align_up(new_rva + patch_content_size as u32, exe_pe.sec_align);
+    // New SizeOfImage: virtual end of the last new section (including fillers).
+    let new_size_of_image = entries
+        .iter()
+        .map(|e| e.virt_addr + e.virt_size)
+        .max()
+        .map(|end| align_up(end, exe_pe.sec_align))
+        .unwrap_or(new_rva + exe_pe.sec_align);
     w32(
         &mut out,
         exe_pe.oh + offset_of!(IMAGE_OPTIONAL_HEADER32, SizeOfImage),
         new_size_of_image,
     );
 
-    // Increment NumberOfSections
+    // Increment NumberOfSections.
     let old_num = r16(&out, exe_pe.fh + offset_of!(IMAGE_FILE_HEADER, NumberOfSections));
     w16(
         &mut out,
         exe_pe.fh + offset_of!(IMAGE_FILE_HEADER, NumberOfSections),
-        old_num + 1,
+        old_num + num_new_secs as u16,
     );
 
-    // Append new .patch section header
-    out[new_sh_off..new_sh_off + 8].copy_from_slice(b".patch\0\0"); // Name
-    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, Misc), patch_content_size as u32);
-    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, VirtualAddress), new_rva);
-    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, SizeOfRawData), raw_size_aligned);
-    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, PointerToRawData), new_raw);
-    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, PointerToRelocations), 0);
-    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, PointerToLinenumbers), 0);
-    w16(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, NumberOfRelocations), 0);
-    w16(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, NumberOfLinenumbers), 0);
-    w32(
-        &mut out,
-        new_sh_off + offset_of!(IMAGE_SECTION_HEADER, Characteristics),
-        IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
-    );
+    // Write one section header per embedded entry.
+    for (i, (entry, &(raw_ptr, raw_size_aligned))) in
+        entries.iter().zip(sec_placements.iter()).enumerate()
+    {
+        let sh_off = new_sh_off + i * sec_hdr_sz;
+        out[sh_off..sh_off + 8].copy_from_slice(&entry.name);
+        w32(&mut out, sh_off + offset_of!(IMAGE_SECTION_HEADER, Misc), entry.virt_size);
+        w32(&mut out, sh_off + offset_of!(IMAGE_SECTION_HEADER, VirtualAddress), entry.virt_addr);
+        w32(&mut out, sh_off + offset_of!(IMAGE_SECTION_HEADER, SizeOfRawData), raw_size_aligned);
+        w32(&mut out, sh_off + offset_of!(IMAGE_SECTION_HEADER, PointerToRawData), raw_ptr);
+        w32(&mut out, sh_off + offset_of!(IMAGE_SECTION_HEADER, PointerToRelocations), 0);
+        w32(&mut out, sh_off + offset_of!(IMAGE_SECTION_HEADER, PointerToLinenumbers), 0);
+        w16(&mut out, sh_off + offset_of!(IMAGE_SECTION_HEADER, NumberOfRelocations), 0);
+        w16(&mut out, sh_off + offset_of!(IMAGE_SECTION_HEADER, NumberOfLinenumbers), 0);
+        w32(
+            &mut out,
+            sh_off + offset_of!(IMAGE_SECTION_HEADER, Characteristics),
+            entry.characteristics,
+        );
+    }
+
 
     Ok(out)
 }
