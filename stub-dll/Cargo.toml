@@ -1,0 +1,28 @@
+[package]
+name = "stub-dll"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "stub"
+crate-type = ["cdylib"]
+
+[dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+# Abort on panic (no unwinding CRT needed).
+[profile.dev]
+panic = "abort"
+# LTO eliminates dead code (e.g. core's u128 formatter that would otherwise
+# require __aullrem / __aulldiv helpers we cannot implement without recursion).
+lto = true
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = true

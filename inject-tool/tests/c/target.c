@@ -2,6 +2,7 @@
  * target.c — minimal no-CRT x86 Windows EXE used as injection target.
  *
  * Imports: GetStdHandle, WriteFile, ExitProcess (kernel32)
+ *          HeapAlloc, GetProcessHeap, WriteConsoleW  ← also needed by stub.dll
  * Entry:   entry()  — prints "original\n" then exits with code 0.
  *
  * Build (MSVC x86, no CRT):
@@ -14,6 +15,21 @@
 #include <windows.h>
 
 static const char msg[] = "original\n";
+
+/*
+ * Force all functions that stub.dll imports to be present in this EXE's IAT.
+ * The inject-tool requires every DLL import to already exist in the target.
+ * A volatile pointer table prevents the linker from dead-stripping these refs.
+ */
+typedef void (*fnptr_t)(void);
+volatile fnptr_t _required_imports[] = {
+    (fnptr_t)GetStdHandle,
+    (fnptr_t)WriteFile,
+    (fnptr_t)ExitProcess,
+    (fnptr_t)HeapAlloc,
+    (fnptr_t)GetProcessHeap,
+    (fnptr_t)WriteConsoleW,
+};
 
 void __cdecl entry(void)
 {
