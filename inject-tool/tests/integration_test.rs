@@ -78,7 +78,7 @@ fn build_target_exe(vcvarsall: &Path, work_dir: &Path) -> PathBuf {
         vcvarsall,
         work_dir,
         "cl /nologo /W3 /Ox /GS- /c target.c && \
-         link /NODEFAULTLIB /ENTRY:entry /SUBSYSTEM:CONSOLE \
+         link /NODEFAULTLIB /ENTRY:entry /SUBSYSTEM:CONSOLE /DYNAMICBASE:NO \
               /OUT:target.exe target.obj kernel32.lib",
     );
     work_dir.join("target.exe")

@@ -350,15 +350,59 @@ unsafe extern "C" fn __CxxFrameHandler3() {}
 #[no_mangle]
 static _fltused: core::ffi::c_int = 1;
 
-/// 64-bit unsigned divide/remainder helpers — required by core's u128 formatter
-/// on x86.  Implemented via Rust's own u64 division (no recursion: the compiler
-/// emits `__udivdi3` / inline sequences rather than calling `__aulldiv` again).
+/// 64-bit unsigned divide/remainder helpers required by the MSVC x86 ABI.
+///
+/// LLVM generates calls to `__aulldiv` / `__aullrem` (exact symbol names,
+/// no cdecl `_` prefix) for u64 operations on x86.  We provide them here
+/// using only shifts and subtracts to avoid infinite recursion (using `/` or
+/// `%` on u64 would itself call these helpers).
+///
+/// `#[export_name]` bypasses MSVC cdecl's leading-underscore decoration so
+/// the linker sees exactly `__aulldiv` / `__aullrem`.
 #[no_mangle]
-unsafe extern "C" fn __aulldiv(a: u64, b: u64) -> u64 {
-    a / b
+#[export_name = "__aulldiv"]
+unsafe extern "C" fn aulldiv_impl(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        return 0;
+    }
+    let mut n = a;
+    let mut d = b;
+    let mut bit: u64 = 1;
+    while d < n && (d >> 63) == 0 {
+        d <<= 1;
+        bit <<= 1;
+    }
+    let mut q: u64 = 0;
+    while bit != 0 {
+        if n >= d {
+            n -= d;
+            q |= bit;
+        }
+        d >>= 1;
+        bit >>= 1;
+    }
+    q
 }
 
 #[no_mangle]
-unsafe extern "C" fn __aullrem(a: u64, b: u64) -> u64 {
-    a % b
+#[export_name = "__aullrem"]
+unsafe extern "C" fn aullrem_impl(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        return 0;
+    }
+    let mut n = a;
+    let mut d = b;
+    let mut bit: u64 = 1;
+    while d < n && (d >> 63) == 0 {
+        d <<= 1;
+        bit <<= 1;
+    }
+    while bit != 0 {
+        if n >= d {
+            n -= d;
+        }
+        d >>= 1;
+        bit >>= 1;
+    }
+    n
 }
