@@ -1,4 +1,4 @@
-//! inject-tool
+﻿//! inject-tool
 //!
 //! Injects a 32-bit stub DLL into a 32-bit Windows EXE by:
 //!   1. Embedding the DLL image as a new `.patch` section.
@@ -9,6 +9,24 @@
 //! Usage: inject-tool <target.exe> <stub.dll> <output.exe>
 
 use std::collections::HashMap;
+use std::mem::{offset_of, size_of};
+
+// PE structs and constants from the windows-sys crate, so field offsets are
+// derived from the canonical Windows SDK layout rather than hardcoded numbers.
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    IMAGE_DATA_DIRECTORY, IMAGE_FILE_HEADER, IMAGE_OPTIONAL_HEADER32, IMAGE_SECTION_HEADER,
+    IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
+};
+use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_I386;
+use windows_sys::Win32::System::SystemServices::{
+    IMAGE_BASE_RELOCATION, IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_IMPORT_DESCRIPTOR,
+    IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE, IMAGE_REL_BASED_HIGHLOW,
+};
+
+/// DataDirectory index constants.
+const DDIR_EXPORT: usize = 0;
+const DDIR_IMPORT: usize = 1;
+const DDIR_BASERELOC: usize = 5;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -36,7 +54,22 @@ fn fatal(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-// ─── binary helpers ──────────────────────────────────────────────────────────
+//  Binary helpers ─
+
+/// Read a `T` from `d[o..]` without assuming alignment.
+///
+/// Using `read_unaligned` is correct here because PE data inside a `Vec<u8>`
+/// is not guaranteed to be aligned to `align_of::<T>()`.
+fn read_at<T: Copy>(d: &[u8], o: usize) -> Result<T, String> {
+    let sz = size_of::<T>();
+    if o.checked_add(sz).map_or(true, |end| end > d.len()) {
+        return Err(format!(
+            "reading {} bytes at 0x{:X}: out of bounds (data len 0x{:X})",
+            sz, o, d.len()
+        ));
+    }
+    Ok(unsafe { (d.as_ptr().add(o) as *const T).read_unaligned() })
+}
 
 fn r16(d: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([d[o], d[o + 1]])
@@ -67,15 +100,14 @@ fn read_cstr(d: &[u8], o: usize) -> String {
     String::from_utf8_lossy(&d[o..o + end]).into_owned()
 }
 
-// ─── PE structures ───────────────────────────────────────────────────────────
+//  PE structures ─
 
 struct Pe {
-    /// File offset of NT signature ("PE\0\0").
-    nt: usize,
-    /// File offset of IMAGE_FILE_HEADER (nt + 4).
+    /// File offset of IMAGE_FILE_HEADER.
     fh: usize,
-    /// File offset of IMAGE_OPTIONAL_HEADER32 (nt + 24).
+    /// File offset of IMAGE_OPTIONAL_HEADER32.
     oh: usize,
+    /// Value of IMAGE_FILE_HEADER.SizeOfOptionalHeader.
     oh_size: u16,
 
     image_base: u32,
@@ -94,9 +126,6 @@ struct Sec {
     virtual_address: u32,
     raw_size: u32,
     raw_ptr: u32,
-    characteristics: u32,
-    /// File offset of the 40-byte section header entry.
-    hdr_off: usize,
 }
 
 impl Sec {
@@ -107,70 +136,68 @@ impl Sec {
 
 impl Pe {
     fn parse(d: &[u8]) -> Result<Self, String> {
-        if d.len() < 0x40 {
-            return Err("file too small".into());
-        }
-        if r16(d, 0) != 0x5A4D {
-            return Err("not a DOS executable (bad MZ signature)".into());
-        }
-        let nt = r32(d, 0x3C) as usize;
-        if nt + 4 > d.len() {
-            return Err("e_lfanew points beyond file".into());
-        }
-        if r32(d, nt) != 0x0000_4550 {
-            return Err("invalid PE signature".into());
+        //  DOS header 
+        let dos: IMAGE_DOS_HEADER =
+            read_at(d, 0).map_err(|e| format!("DOS header: {}", e))?;
+        if dos.e_magic != IMAGE_DOS_SIGNATURE {
+            return Err(format!(
+                "not a DOS executable (e_magic=0x{:04X})",
+                dos.e_magic
+            ));
         }
 
-        let fh = nt + 4; // IMAGE_FILE_HEADER
-        if fh + 20 > d.len() {
-            return Err("file header out of bounds".into());
-        }
-        let machine = r16(d, fh);
-        if machine != 0x014C {
-            return Err(format!("not x86 (machine=0x{:04X})", machine));
+        let nt = dos.e_lfanew as usize;
+        let sig: u32 = read_at(d, nt).map_err(|e| format!("PE signature: {}", e))?;
+        if sig != IMAGE_NT_SIGNATURE {
+            return Err(format!("invalid PE signature (0x{:08X})", sig));
         }
 
-        let num_secs = r16(d, fh + 2) as usize;
-        let oh_size = r16(d, fh + 16);
-        let oh = fh + 20; // IMAGE_OPTIONAL_HEADER32
+        //  File header 
+        let fh = nt + size_of::<u32>(); // skip 4-byte Signature
+        let fh_s: IMAGE_FILE_HEADER =
+            read_at(d, fh).map_err(|e| format!("file header: {}", e))?;
+        if fh_s.Machine != IMAGE_FILE_MACHINE_I386 {
+            return Err(format!("not x86 (machine=0x{:04X})", fh_s.Machine));
+        }
 
+        let num_secs = fh_s.NumberOfSections as usize;
+        let oh_size = fh_s.SizeOfOptionalHeader;
+
+        //  Optional header 
+        let oh = fh + size_of::<IMAGE_FILE_HEADER>();
         if oh + oh_size as usize > d.len() {
             return Err("optional header out of bounds".into());
         }
-        let magic = r16(d, oh);
-        if magic != 0x010B {
-            return Err(format!("not PE32 (magic=0x{:04X})", magic));
+        let oh_s: IMAGE_OPTIONAL_HEADER32 =
+            read_at(d, oh).map_err(|e| format!("optional header: {}", e))?;
+        if oh_s.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC {
+            return Err(format!("not PE32 (magic=0x{:04X})", oh_s.Magic));
         }
 
-        let entry_rva = r32(d, oh + 16);
-        let image_base = r32(d, oh + 28);
-        let sec_align = r32(d, oh + 32);
-        let file_align = r32(d, oh + 36);
-        let size_of_image = r32(d, oh + 56);
-        let size_of_headers = r32(d, oh + 60);
+        let entry_rva = oh_s.AddressOfEntryPoint;
+        let image_base = oh_s.ImageBase;
+        let sec_align = oh_s.SectionAlignment;
+        let file_align = oh_s.FileAlignment;
+        let size_of_image = oh_s.SizeOfImage;
+        let size_of_headers = oh_s.SizeOfHeaders;
 
+        //  Section headers 
         let shdrs_base = oh + oh_size as usize;
         let mut sections = Vec::with_capacity(num_secs);
         for i in 0..num_secs {
-            let o = shdrs_base + i * 40;
-            if o + 40 > d.len() {
-                return Err(format!("section header {} out of bounds", i));
-            }
-            let mut name = [0u8; 8];
-            name.copy_from_slice(&d[o..o + 8]);
+            let o = shdrs_base + i * size_of::<IMAGE_SECTION_HEADER>();
+            let sec: IMAGE_SECTION_HEADER =
+                read_at(d, o).map_err(|_| format!("section header {} out of bounds", i))?;
             sections.push(Sec {
-                name,
-                virtual_size: r32(d, o + 8),
-                virtual_address: r32(d, o + 12),
-                raw_size: r32(d, o + 16),
-                raw_ptr: r32(d, o + 20),
-                characteristics: r32(d, o + 36),
-                hdr_off: o,
+                name: sec.Name,
+                virtual_size: unsafe { sec.Misc.VirtualSize },
+                virtual_address: sec.VirtualAddress,
+                raw_size: sec.SizeOfRawData,
+                raw_ptr: sec.PointerToRawData,
             });
         }
 
         Ok(Pe {
-            nt,
             fh,
             oh,
             oh_size,
@@ -195,39 +222,45 @@ impl Pe {
         None
     }
 
-    /// File offset of DataDirectory entry `idx` (each entry is 8 bytes: RVA + Size).
+    /// File offset of DataDirectory entry `idx`.
+    ///
+    /// Uses `offset_of!(IMAGE_OPTIONAL_HEADER32, DataDirectory)` so the offset
+    /// is derived from the windows-sys struct layout rather than a literal constant.
     fn ddir(&self, idx: usize) -> usize {
-        self.oh + 96 + idx * 8
+        self.oh
+            + offset_of!(IMAGE_OPTIONAL_HEADER32, DataDirectory)
+            + idx * size_of::<IMAGE_DATA_DIRECTORY>()
     }
 
-    /// File offset of the section headers region.
+    /// File offset of the section-headers region.
     fn shdrs_base(&self) -> usize {
         self.oh + self.oh_size as usize
     }
 }
 
-// ─── EXE: collect imports  (dll_lower, func_name) → IAT RVA ─────────────────
+//  EXE: collect imports  (dll_lower, func_name)  IAT RVA ─
 
 fn read_exe_imports(d: &[u8], pe: &Pe) -> Result<HashMap<(String, String), u32>, String> {
     let mut map = HashMap::new();
-    let dir = pe.ddir(1); // IMAGE_DIRECTORY_ENTRY_IMPORT
+    let dir = pe.ddir(DDIR_IMPORT);
     let rva = r32(d, dir);
     let sz = r32(d, dir + 4);
     if rva == 0 || sz == 0 {
         return Ok(map);
     }
 
-    let mut desc = pe
+    let mut desc_off = pe
         .rva2off(rva)
         .ok_or("import directory RVA not mapped to any section")?;
 
     loop {
-        if desc + 20 > d.len() {
+        if desc_off + size_of::<IMAGE_IMPORT_DESCRIPTOR>() > d.len() {
             break;
         }
-        let orig = r32(d, desc);
-        let name_rva = r32(d, desc + 12);
-        let iat_rva = r32(d, desc + 16);
+        let desc: IMAGE_IMPORT_DESCRIPTOR = read_at(d, desc_off)?;
+        let orig = unsafe { desc.Anonymous.OriginalFirstThunk };
+        let name_rva = desc.Name;
+        let iat_rva = desc.FirstThunk;
 
         if name_rva == 0 && orig == 0 && iat_rva == 0 {
             break; // null terminator descriptor
@@ -257,9 +290,7 @@ fn read_exe_imports(d: &[u8], pe: &Pe) -> Result<HashMap<(String, String), u32>,
             }
             if thunk & 0x8000_0000 == 0 {
                 // Import by name: thunk is RVA of IMAGE_IMPORT_BY_NAME
-                let ibn = pe
-                    .rva2off(thunk)
-                    .ok_or("import-by-name RVA not mapped")?;
+                let ibn = pe.rva2off(thunk).ok_or("import-by-name RVA not mapped")?;
                 let func = read_cstr(d, ibn + 2); // skip 2-byte Hint
                 map.insert((dll_lo.clone(), func), cur_iat);
             }
@@ -267,34 +298,35 @@ fn read_exe_imports(d: &[u8], pe: &Pe) -> Result<HashMap<(String, String), u32>,
             cur_iat += 4;
         }
 
-        desc += 20;
+        desc_off += size_of::<IMAGE_IMPORT_DESCRIPTOR>();
     }
 
     Ok(map)
 }
 
-// ─── DLL: collect imports  Vec<(dll_lower, func_name, iat_rva_in_dll)> ───────
+//  DLL: collect imports  Vec<(dll_lower, func_name, iat_rva_in_dll)> 
 
 fn read_dll_imports(d: &[u8], pe: &Pe) -> Result<Vec<(String, String, u32)>, String> {
     let mut entries = Vec::new();
-    let dir = pe.ddir(1);
+    let dir = pe.ddir(DDIR_IMPORT);
     let rva = r32(d, dir);
     let sz = r32(d, dir + 4);
     if rva == 0 || sz == 0 {
         return Ok(entries);
     }
 
-    let mut desc = pe
+    let mut desc_off = pe
         .rva2off(rva)
         .ok_or("DLL import directory RVA not mapped")?;
 
     loop {
-        if desc + 20 > d.len() {
+        if desc_off + size_of::<IMAGE_IMPORT_DESCRIPTOR>() > d.len() {
             break;
         }
-        let orig = r32(d, desc);
-        let name_rva = r32(d, desc + 12);
-        let iat_rva = r32(d, desc + 16);
+        let desc: IMAGE_IMPORT_DESCRIPTOR = read_at(d, desc_off)?;
+        let orig = unsafe { desc.Anonymous.OriginalFirstThunk };
+        let name_rva = desc.Name;
+        let iat_rva = desc.FirstThunk;
 
         if name_rva == 0 && orig == 0 && iat_rva == 0 {
             break;
@@ -309,9 +341,7 @@ fn read_dll_imports(d: &[u8], pe: &Pe) -> Result<Vec<(String, String, u32)>, Str
         let dll_lo = read_cstr(d, dll_off).to_lowercase();
 
         let int_rva = if orig != 0 { orig } else { iat_rva };
-        let mut int_off = pe
-            .rva2off(int_rva)
-            .ok_or("DLL INT/IAT RVA not mapped")?;
+        let mut int_off = pe.rva2off(int_rva).ok_or("DLL INT/IAT RVA not mapped")?;
         let mut cur_iat = iat_rva;
 
         loop {
@@ -333,36 +363,30 @@ fn read_dll_imports(d: &[u8], pe: &Pe) -> Result<Vec<(String, String, u32)>, Str
             cur_iat += 4;
         }
 
-        desc += 20;
+        desc_off += size_of::<IMAGE_IMPORT_DESCRIPTOR>();
     }
 
     Ok(entries)
 }
 
-// ─── DLL: find a symbol RVA ──────────────────────────────────────────────────
+//  DLL: find a symbol RVA 
 
-/// Look up `target` in the DLL's export directory.  Returns the symbol's RVA.
+/// Look up `target` in the DLL's export directory. Returns the symbol RVA.
 fn find_export(d: &[u8], pe: &Pe, target: &str) -> Option<u32> {
-    let dir = pe.ddir(0); // IMAGE_DIRECTORY_ENTRY_EXPORT
+    let dir = pe.ddir(DDIR_EXPORT);
     let rva = r32(d, dir);
     let sz = r32(d, dir + 4);
     if rva == 0 || sz == 0 {
         return None;
     }
 
-    let exp = pe.rva2off(rva)?;
-    if exp + 40 > d.len() {
-        return None;
-    }
+    let exp_off = pe.rva2off(rva)?;
+    let exp: IMAGE_EXPORT_DIRECTORY = read_at(d, exp_off).ok()?;
 
-    let num_names = r32(d, exp + 24) as usize;
-    let funcs_rva = r32(d, exp + 28);
-    let names_rva = r32(d, exp + 32);
-    let ords_rva = r32(d, exp + 36);
-
-    let funcs_off = pe.rva2off(funcs_rva)?;
-    let names_off = pe.rva2off(names_rva)?;
-    let ords_off = pe.rva2off(ords_rva)?;
+    let num_names = exp.NumberOfNames as usize;
+    let funcs_off = pe.rva2off(exp.AddressOfFunctions)?;
+    let names_off = pe.rva2off(exp.AddressOfNames)?;
+    let ords_off = pe.rva2off(exp.AddressOfNameOrdinals)?;
 
     for i in 0..num_names {
         if names_off + i * 4 + 4 > d.len() {
@@ -385,24 +409,31 @@ fn find_export(d: &[u8], pe: &Pe, target: &str) -> Option<u32> {
     None
 }
 
-/// Look up `target` (or `_target`) in the COFF symbol table.  Returns the RVA.
+/// Look up `target` (or `_target`) in the COFF symbol table. Returns the RVA.
+///
+/// COFF symbol entries are 18 bytes each; the IMAGE_FILE_HEADER fields
+/// PointerToSymbolTable / NumberOfSymbols are accessed via offset_of! to avoid
+/// hardcoded offsets.
 fn find_coff_symbol(d: &[u8], pe: &Pe, target: &str) -> Option<u32> {
-    let sym_ptr = r32(d, pe.fh + 8) as usize; // PointerToSymbolTable
-    let num_sym = r32(d, pe.fh + 12) as usize; // NumberOfSymbols
+    let sym_ptr =
+        r32(d, pe.fh + offset_of!(IMAGE_FILE_HEADER, PointerToSymbolTable)) as usize;
+    let num_sym = r32(d, pe.fh + offset_of!(IMAGE_FILE_HEADER, NumberOfSymbols)) as usize;
     if sym_ptr == 0 || num_sym == 0 {
         return None;
     }
-    if sym_ptr.checked_add(num_sym.checked_mul(18)?)? > d.len() {
+
+    const COFF_SYM_SIZE: usize = 18; // sizeof(IMAGE_SYMBOL)
+    if sym_ptr.checked_add(num_sym.checked_mul(COFF_SYM_SIZE)?)? > d.len() {
         return None;
     }
 
-    let strtab = sym_ptr + num_sym * 18;
+    let strtab = sym_ptr + num_sym * COFF_SYM_SIZE;
     let decorated = format!("_{}", target);
     let mut i = 0usize;
 
     while i < num_sym {
-        let o = sym_ptr + i * 18;
-        if o + 18 > d.len() {
+        let o = sym_ptr + i * COFF_SYM_SIZE;
+        if o + COFF_SYM_SIZE > d.len() {
             break;
         }
 
@@ -445,10 +476,10 @@ fn find_inner_entry(d: &[u8], pe: &Pe) -> Result<u32, String> {
         .ok_or_else(|| "symbol 'inner_entry' not found in DLL (export table or COFF)".to_string())
 }
 
-// ─── core injection ──────────────────────────────────────────────────────────
+//  core injection 
 
 fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
-    // ── Parse headers ──────────────────────────────────────────────────────
+    //  Parse headers 
     let exe_pe = Pe::parse(exe_data).map_err(|e| format!("EXE: {}", e))?;
     let dll_pe = Pe::parse(dll_data).map_err(|e| format!("DLL: {}", e))?;
 
@@ -457,13 +488,13 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     let dll_entry_rva = dll_pe.entry_rva;
     let dll_img_size = dll_pe.size_of_image as usize;
 
-    // ── Collect imports ────────────────────────────────────────────────────
+    //  Collect imports ─
     let exe_imports = read_exe_imports(exe_data, &exe_pe)
         .map_err(|e| format!("reading EXE imports: {}", e))?;
     let dll_imports = read_dll_imports(dll_data, &dll_pe)
         .map_err(|e| format!("reading DLL imports: {}", e))?;
 
-    // ── Validate: every DLL import must exist in the EXE ──────────────────
+    //  Validate: every DLL import must exist in the EXE 
     for (dll_name, func_name, _iat_rva) in &dll_imports {
         if !exe_imports.contains_key(&(dll_name.clone(), func_name.clone())) {
             return Err(format!(
@@ -473,10 +504,10 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
 
-    // ── Find inner_entry ───────────────────────────────────────────────────
+    //  Find inner_entry 
     let inner_entry_rva = find_inner_entry(dll_data, &dll_pe)?;
 
-    // ── Build the DLL in-memory image ──────────────────────────────────────
+    //  Build the DLL in-memory image 
     let mut dll_image = vec![0u8; dll_img_size];
 
     // Copy PE headers
@@ -510,22 +541,19 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
             .copy_from_slice(&dll_data[src_start..src_start + copy_len]);
     }
 
-    // ── Compute new section placement in EXE ───────────────────────────────
-    let last = exe_pe
-        .sections
-        .last()
-        .ok_or("EXE has no sections")?;
+    //  Compute new section placement in EXE 
+    let last = exe_pe.sections.last().ok_or("EXE has no sections")?;
 
     let new_rva = align_up(last.end_rva(), exe_pe.sec_align);
     let new_raw = align_up(last.raw_ptr + last.raw_size, exe_pe.file_align);
 
-    // ── Apply DLL base relocations ─────────────────────────────────────────
+    //  Apply DLL base relocations 
     // The DLL will reside at virtual address: exe_image_base + new_rva
     let load_base = exe_pe.image_base.wrapping_add(new_rva);
     let delta = (load_base as i64) - (dll_image_base as i64);
 
     {
-        let dir = dll_pe.ddir(5); // IMAGE_DIRECTORY_ENTRY_BASERELOC
+        let dir = dll_pe.ddir(DDIR_BASERELOC);
         let reloc_rva = r32(dll_data, dir);
         let reloc_sz = r32(dll_data, dir + 4);
 
@@ -534,27 +562,27 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
                 .rva2off(reloc_rva)
                 .ok_or("DLL relocation directory RVA not mapped")?;
             let reloc_end = reloc_start + reloc_sz as usize;
+            let blk_hdr_sz = size_of::<IMAGE_BASE_RELOCATION>();
 
             let mut pos = reloc_start;
-            while pos + 8 <= reloc_end.min(dll_data.len()) {
-                let block_rva = r32(dll_data, pos);
-                let block_size = r32(dll_data, pos + 4);
-                if block_size < 8 {
+            while pos + blk_hdr_sz <= reloc_end.min(dll_data.len()) {
+                let blk: IMAGE_BASE_RELOCATION = read_at(dll_data, pos)
+                    .map_err(|e| format!("relocation block: {}", e))?;
+                if blk.SizeOfBlock < blk_hdr_sz as u32 {
                     break;
                 }
-                let num_entries = (block_size - 8) / 2;
-                for j in 0..num_entries as usize {
-                    let eo = pos + 8 + j * 2;
+                let num_entries = (blk.SizeOfBlock as usize - blk_hdr_sz) / 2;
+                for j in 0..num_entries {
+                    let eo = pos + blk_hdr_sz + j * 2;
                     if eo + 2 > dll_data.len() {
                         break;
                     }
                     let entry = r16(dll_data, eo);
-                    let rel_type = entry >> 12;
+                    let rel_type = (entry >> 12) as u32;
                     let offset = (entry & 0x0FFF) as u32;
 
-                    if rel_type == 3 {
-                        // IMAGE_REL_BASED_HIGHLOW
-                        let target_rva = block_rva + offset;
+                    if rel_type == IMAGE_REL_BASED_HIGHLOW {
+                        let target_rva = blk.VirtualAddress + offset;
                         let idx = target_rva as usize;
                         if idx + 4 > dll_image.len() {
                             return Err(format!(
@@ -569,37 +597,29 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
                         dll_image[idx..idx + 4].copy_from_slice(&new_val.to_le_bytes());
                     }
                 }
-                pos += block_size as usize;
+                pos += blk.SizeOfBlock as usize;
             }
         }
     }
 
-    // ── Redirect DLL IAT entries via JMP thunks ────────────────────────────
+    //  Redirect DLL IAT entries via JMP thunks ─
     //
     // The DLL's code does  `call dword ptr [dll_iat_slot]`  (single-indirect).
     // That slot must hold a *callable* address.  We cannot store the EXE's IAT
-    // data VA directly there because the IAT is filled with function pointers by
-    // the loader and executing those bytes as code would crash.
+    // data VA directly there because the IAT holds function addresses, not code.
     //
-    // Instead, for each import we write a 6-byte JMP thunk in the .patch section
-    // immediately after the DLL image:
+    // Instead we write a 6-byte JMP thunk:   FF 25 [exe_iat_va]
+    //   call [dll_iat_slot]    call thunk    jmp [exe_iat_va]    real fn
     //
-    //   FF 25 [exe_iat_va]   →   jmp dword ptr [exe_iat_va]
-    //
-    // Then point the DLL's IAT slot at the thunk VA.  At runtime:
-    //   call [dll_iat_slot]  →  call thunk  →  jmp [exe_iat_va]
-    //                                         →  jumps to the real function
-    //
-    // The thunk area is appended after the DLL image within the .patch section.
+    // Thunks are appended after the DLL image within the .patch section.
     let thunk_base_rva = new_rva + dll_img_size as u32;
-
     let mut thunk_data: Vec<u8> = Vec::with_capacity(dll_imports.len() * 6);
 
     for (i, (dll_name, func_name, dll_iat_rva)) in dll_imports.iter().enumerate() {
         let exe_iat_rva = exe_imports[&(dll_name.clone(), func_name.clone())];
         let exe_iat_va = exe_pe.image_base.wrapping_add(exe_iat_rva);
 
-        // VA of the thunk for this import
+        // VA of this thunk within the patched EXE's address space
         let thunk_va = exe_pe
             .image_base
             .wrapping_add(thunk_base_rva)
@@ -621,16 +641,18 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
         thunk_data.extend_from_slice(&exe_iat_va.to_le_bytes());
     }
 
-    // ── Disable the embedded DLL's import directory ────────────────────────
-    // Zero out DataDirectory[1] in the in-memory DLL header so that if any
-    // tool walks the PE structures of the patched EXE it won't try to load the
-    // embedded DLL's imports as part of the outer image.
-    let imp_dir_off = dll_pe.oh + 104; // oh + 96 + 1*8
-    if imp_dir_off + 8 <= dll_image.len() {
-        dll_image[imp_dir_off..imp_dir_off + 8].fill(0);
+    //  Disable the embedded DLL's import directory ─
+    // Zero out DataDirectory[IMPORT] in the in-memory DLL header so that the
+    // Windows loader does not process the embedded DLL's imports as part of the
+    // outer EXE.
+    let imp_dir_off = dll_pe.oh
+        + offset_of!(IMAGE_OPTIONAL_HEADER32, DataDirectory)
+        + DDIR_IMPORT * size_of::<IMAGE_DATA_DIRECTORY>();
+    if imp_dir_off + size_of::<IMAGE_DATA_DIRECTORY>() <= dll_image.len() {
+        dll_image[imp_dir_off..imp_dir_off + size_of::<IMAGE_DATA_DIRECTORY>()].fill(0);
     }
 
-    // ── Patch inner_entry with the original EXE entry VA ──────────────────
+    //  Patch inner_entry with the original EXE entry VA 
     let orig_entry_va = exe_pe.image_base.wrapping_add(original_entry_rva);
     let idx = inner_entry_rva as usize;
     if idx + 4 > dll_image.len() {
@@ -641,18 +663,19 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     }
     dll_image[idx..idx + 4].copy_from_slice(&orig_entry_va.to_le_bytes());
 
-    // ── Verify space for new section header ────────────────────────────────
-    let new_sh_off = exe_pe.shdrs_base() + exe_pe.sections.len() * 40;
-    if new_sh_off + 40 > exe_pe.size_of_headers as usize {
+    //  Verify space for new section header ─
+    let sec_hdr_sz = size_of::<IMAGE_SECTION_HEADER>();
+    let new_sh_off = exe_pe.shdrs_base() + exe_pe.sections.len() * sec_hdr_sz;
+    if new_sh_off + sec_hdr_sz > exe_pe.size_of_headers as usize {
         return Err(format!(
             "no room for new section header: end of new header would be at 0x{:X}, \
              but SizeOfHeaders = 0x{:X}",
-            new_sh_off + 40,
+            new_sh_off + sec_hdr_sz,
             exe_pe.size_of_headers
         ));
     }
 
-    // ── Build the output file ──────────────────────────────────────────────
+    //  Build the output file ─
     let patch_content_size = dll_img_size + thunk_data.len();
     let raw_size_aligned = align_up(patch_content_size as u32, exe_pe.file_align);
     let required_len = new_raw as usize + raw_size_aligned as usize;
@@ -669,39 +692,51 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
         out[thunk_off..thunk_off + thunk_data.len()].copy_from_slice(&thunk_data);
     }
 
-    // ── Update EXE headers ─────────────────────────────────────────────────
+    //  Update EXE headers 
 
-    // New entry point: DLL entry offset within the new section
-    w32(&mut out, exe_pe.oh + 16, new_rva + dll_entry_rva);
+    // New entry point: DLL entry within the new section
+    w32(
+        &mut out,
+        exe_pe.oh + offset_of!(IMAGE_OPTIONAL_HEADER32, AddressOfEntryPoint),
+        new_rva + dll_entry_rva,
+    );
 
     // New SizeOfImage
     let new_size_of_image = align_up(new_rva + patch_content_size as u32, exe_pe.sec_align);
-    w32(&mut out, exe_pe.oh + 56, new_size_of_image);
+    w32(
+        &mut out,
+        exe_pe.oh + offset_of!(IMAGE_OPTIONAL_HEADER32, SizeOfImage),
+        new_size_of_image,
+    );
 
     // Increment NumberOfSections
-    let old_num = r16(&out, exe_pe.fh + 2);
-    w16(&mut out, exe_pe.fh + 2, old_num + 1);
+    let old_num = r16(&out, exe_pe.fh + offset_of!(IMAGE_FILE_HEADER, NumberOfSections));
+    w16(
+        &mut out,
+        exe_pe.fh + offset_of!(IMAGE_FILE_HEADER, NumberOfSections),
+        old_num + 1,
+    );
 
-    // Append new section header (.patch)
-    const SEC_CODE: u32 = 0x0000_0020; // IMAGE_SCN_CNT_CODE
-    const SEC_EXEC: u32 = 0x2000_0000; // IMAGE_SCN_MEM_EXECUTE
-    const SEC_READ: u32 = 0x4000_0000; // IMAGE_SCN_MEM_READ
-
-    out[new_sh_off..new_sh_off + 8].copy_from_slice(b".patch\0\0");
-    w32(&mut out, new_sh_off + 8, patch_content_size as u32); // VirtualSize
-    w32(&mut out, new_sh_off + 12, new_rva); // VirtualAddress
-    w32(&mut out, new_sh_off + 16, raw_size_aligned); // SizeOfRawData
-    w32(&mut out, new_sh_off + 20, new_raw); // PointerToRawData
-    w32(&mut out, new_sh_off + 24, 0); // PointerToRelocations
-    w32(&mut out, new_sh_off + 28, 0); // PointerToLinenumbers
-    w16(&mut out, new_sh_off + 32, 0); // NumberOfRelocations
-    w16(&mut out, new_sh_off + 34, 0); // NumberOfLinenumbers
-    w32(&mut out, new_sh_off + 36, SEC_CODE | SEC_EXEC | SEC_READ); // Characteristics
+    // Append new .patch section header
+    out[new_sh_off..new_sh_off + 8].copy_from_slice(b".patch\0\0"); // Name
+    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, Misc), patch_content_size as u32);
+    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, VirtualAddress), new_rva);
+    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, SizeOfRawData), raw_size_aligned);
+    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, PointerToRawData), new_raw);
+    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, PointerToRelocations), 0);
+    w32(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, PointerToLinenumbers), 0);
+    w16(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, NumberOfRelocations), 0);
+    w16(&mut out, new_sh_off + offset_of!(IMAGE_SECTION_HEADER, NumberOfLinenumbers), 0);
+    w32(
+        &mut out,
+        new_sh_off + offset_of!(IMAGE_SECTION_HEADER, Characteristics),
+        IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
+    );
 
     Ok(out)
 }
 
-// ─── tests ───────────────────────────────────────────────────────────────────
+//  tests 
 
 #[cfg(test)]
 mod tests {

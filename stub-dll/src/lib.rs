@@ -359,7 +359,6 @@ static _fltused: core::ffi::c_int = 1;
 ///
 /// `#[export_name]` bypasses MSVC cdecl's leading-underscore decoration so
 /// the linker sees exactly `__aulldiv` / `__aullrem`.
-#[no_mangle]
 #[export_name = "__aulldiv"]
 unsafe extern "C" fn aulldiv_impl(a: u64, b: u64) -> u64 {
     if b == 0 {
@@ -384,7 +383,6 @@ unsafe extern "C" fn aulldiv_impl(a: u64, b: u64) -> u64 {
     q
 }
 
-#[no_mangle]
 #[export_name = "__aullrem"]
 unsafe extern "C" fn aullrem_impl(a: u64, b: u64) -> u64 {
     if b == 0 {
