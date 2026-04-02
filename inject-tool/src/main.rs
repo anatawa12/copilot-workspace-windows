@@ -237,15 +237,20 @@ impl Pe {
     }
 }
 
-//  EXE: collect imports  (dll_lower, func_name)  IAT RVA ─
+//  Import-table reader ─
 
-fn read_exe_imports(d: &[u8], pe: &Pe) -> Result<HashMap<(String, String), u32>, String> {
-    let mut map = HashMap::new();
+/// Read all name-based imports from the PE image `d`/`pe` and return them as
+/// a flat list of `(dll_name_lowercase, function_name, iat_rva)` triples.
+///
+/// Returns an error if any import thunk uses ordinal-only form (high bit set),
+/// as ordinal imports cannot be matched by name in the EXE's IAT.
+fn read_imports(d: &[u8], pe: &Pe) -> Result<Vec<(String, String, u32)>, String> {
+    let mut entries = Vec::new();
     let dir = pe.ddir(DDIR_IMPORT);
     let rva = r32(d, dir);
     let sz = r32(d, dir + 4);
     if rva == 0 || sz == 0 {
-        return Ok(map);
+        return Ok(entries);
     }
 
     let mut desc_off = pe
@@ -276,7 +281,7 @@ fn read_exe_imports(d: &[u8], pe: &Pe) -> Result<HashMap<(String, String), u32>,
         let int_rva = if orig != 0 { orig } else { iat_rva };
         let mut int_off = pe
             .rva2off(int_rva)
-            .ok_or("INT/IAT RVA not mapped in EXE imports")?;
+            .ok_or("INT/IAT RVA not mapped in imports")?;
         let mut cur_iat = iat_rva;
 
         loop {
@@ -287,77 +292,18 @@ fn read_exe_imports(d: &[u8], pe: &Pe) -> Result<HashMap<(String, String), u32>,
             if thunk == 0 {
                 break;
             }
-            if thunk & 0x8000_0000 == 0 {
-                // Import by name: thunk is RVA of IMAGE_IMPORT_BY_NAME
-                let ibn = pe.rva2off(thunk).ok_or("import-by-name RVA not mapped")?;
-                let func = read_cstr(d, ibn + 2); // skip 2-byte Hint
-                map.insert((dll_lo.clone(), func), cur_iat);
+            if thunk & 0x8000_0000 != 0 {
+                return Err(format!(
+                    "ordinal import not supported: {}!#{} (ordinal-only imports cannot \
+                     be matched by name)",
+                    dll_lo,
+                    thunk & 0x7fff_ffff
+                ));
             }
-            int_off += 4;
-            cur_iat += 4;
-        }
-
-        desc_off += size_of::<IMAGE_IMPORT_DESCRIPTOR>();
-    }
-
-    Ok(map)
-}
-
-//  DLL: collect imports  Vec<(dll_lower, func_name, iat_rva_in_dll)> 
-
-fn read_dll_imports(d: &[u8], pe: &Pe) -> Result<Vec<(String, String, u32)>, String> {
-    let mut entries = Vec::new();
-    let dir = pe.ddir(DDIR_IMPORT);
-    let rva = r32(d, dir);
-    let sz = r32(d, dir + 4);
-    if rva == 0 || sz == 0 {
-        return Ok(entries);
-    }
-
-    let mut desc_off = pe
-        .rva2off(rva)
-        .ok_or("DLL import directory RVA not mapped")?;
-
-    loop {
-        if desc_off + size_of::<IMAGE_IMPORT_DESCRIPTOR>() > d.len() {
-            break;
-        }
-        let desc: IMAGE_IMPORT_DESCRIPTOR = read_at(d, desc_off)?;
-        let orig = unsafe { desc.Anonymous.OriginalFirstThunk };
-        let name_rva = desc.Name;
-        let iat_rva = desc.FirstThunk;
-
-        if name_rva == 0 && orig == 0 && iat_rva == 0 {
-            break;
-        }
-        if name_rva == 0 {
-            break;
-        }
-
-        let dll_off = pe
-            .rva2off(name_rva)
-            .ok_or("DLL import DLL-name RVA not mapped")?;
-        let dll_lo = read_cstr(d, dll_off).to_lowercase();
-
-        let int_rva = if orig != 0 { orig } else { iat_rva };
-        let mut int_off = pe.rva2off(int_rva).ok_or("DLL INT/IAT RVA not mapped")?;
-        let mut cur_iat = iat_rva;
-
-        loop {
-            if int_off + 4 > d.len() {
-                break;
-            }
-            let thunk = r32(d, int_off);
-            if thunk == 0 {
-                break;
-            }
-            if thunk & 0x8000_0000 == 0 {
-                let ibn = pe
-                    .rva2off(thunk)
-                    .ok_or("DLL import-by-name RVA not mapped")?;
-                let func = read_cstr(d, ibn + 2);
-                entries.push((dll_lo.clone(), func, cur_iat));
-            }
+            // Import by name: thunk is RVA of IMAGE_IMPORT_BY_NAME
+            let ibn = pe.rva2off(thunk).ok_or("import-by-name RVA not mapped")?;
+            let func = read_cstr(d, ibn + 2); // skip 2-byte Hint
+            entries.push((dll_lo.clone(), func, cur_iat));
             int_off += 4;
             cur_iat += 4;
         }
@@ -487,9 +433,13 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     let dll_entry_rva = dll_pe.entry_rva;
 
     //  Collect imports
-    let exe_imports = read_exe_imports(exe_data, &exe_pe)
-        .map_err(|e| format!("reading EXE imports: {}", e))?;
-    let dll_imports = read_dll_imports(dll_data, &dll_pe)
+    let exe_imports: HashMap<(String, String), u32> =
+        read_imports(exe_data, &exe_pe)
+            .map_err(|e| format!("reading EXE imports: {}", e))?
+            .into_iter()
+            .map(|(dll, func, iat_rva)| ((dll, func), iat_rva))
+            .collect();
+    let dll_imports = read_imports(dll_data, &dll_pe)
         .map_err(|e| format!("reading DLL imports: {}", e))?;
 
     //  Validate: every DLL import must exist in the EXE
@@ -511,35 +461,42 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     //   VirtualAddress = new_rva + dll_sec.virtual_address
     // so the original DLL inter-section gaps are preserved in virtual space.
     //
-    // The Windows PE loader requires sections to be virtually contiguous
-    // (no unmapped gap  SectionAlignment between consecutive sections).
-    // We insert BSS "gap-filler" entries to satisfy this wherever needed:
-    // before the first DLL section and between any non-contiguous pair.
+    // The Windows PE loader requires sections to be virtually contiguous —
+    // a section whose VirtualAddress is not immediately adjacent to the
+    // section-aligned end of the preceding section causes the loader to reject
+    // the image with STATUS_INVALID_IMAGE_FORMAT (ERROR_BAD_EXE_FORMAT).
+    // See: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
+    //      #section-table-section-headers (ordering / virtual-address rules)
     //
-    // The .reloc section is excluded  its data was consumed during the
-    // relocation pass below and is not needed at run time.
+    // To satisfy this without adding blank section headers, we extend the
+    // VirtualSize of an existing section to cover any gap:
+    //   • Gap before the first DLL section → extend the last EXE section.
+    //   • Gap between two DLL sections    → extend the preceding DLL section.
+    //
+    // The .reloc section is excluded — its data is consumed below and is not
+    // needed at run time.
 
     //  Compute new section placement in EXE ─
     let last = exe_pe.sections.last().ok_or("EXE has no sections")?;
     let new_rva = align_up(last.end_rva(), exe_pe.sec_align);
     let new_raw = align_up(last.raw_ptr + last.raw_size, exe_pe.file_align);
 
-    // IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
-    const FILLER_CHAR: u32 = 0x40000040;
-
     struct EmbedEntry {
         name: [u8; 8],
         virt_addr: u32,        // VirtualAddress in the output EXE
         virt_size: u32,        // VirtualSize in the section header
         characteristics: u32,
-        buf: Vec<u8>,          // raw data; empty for BSS gap-fillers
-        dll_sec_idx: Option<usize>, // None for gap-fillers
+        buf: Vec<u8>,          // raw data; empty for BSS/uninitialised sections
+        dll_sec_idx: usize,    // index into dll_pe.sections
     }
 
     let mut entries: Vec<EmbedEntry> = Vec::new();
-    // cur_dll_va: section-aligned virtual end of the last processed DLL section,
-    // relative to the DLL image base (starts at 0 = "before first section").
+    // cur_dll_va tracks the section-aligned virtual end of the last processed
+    // DLL section (in DLL VA space, relative to DLL image base; starts at 0).
     let mut cur_dll_va: u32 = 0;
+    // VA gap that must be covered by extending the last EXE section's
+    // VirtualSize (set when the first DLL section doesn't start at VA 0).
+    let mut extend_last_exe_vsize_by: u32 = 0;
 
     for (i, s) in dll_pe.sections.iter().enumerate() {
         let name_end = s.name.iter().position(|&b| b == 0).unwrap_or(s.name.len());
@@ -547,18 +504,17 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
             continue;
         }
 
-        // If there is a virtual gap before this section, insert a BSS filler so
-        // that the loader sees a contiguous virtual address range.
+        // If there is a virtual gap before this section, absorb it by
+        // extending the preceding section's VirtualSize.
         if s.virtual_address > cur_dll_va {
             let gap = s.virtual_address - cur_dll_va;
-            entries.push(EmbedEntry {
-                name: *b".fll\0\0\0\0",
-                virt_addr: new_rva + cur_dll_va,
-                virt_size: gap,
-                characteristics: FILLER_CHAR,
-                buf: Vec::new(),
-                dll_sec_idx: None,
-            });
+            if entries.is_empty() {
+                // Gap before the first DLL section: extend the last EXE section.
+                extend_last_exe_vsize_by = gap;
+            } else {
+                // Gap between DLL sections: extend the preceding entry.
+                entries.last_mut().unwrap().virt_size += gap;
+            }
         }
 
         // Load raw bytes; pad to virtual extent for any zero-fill within the section.
@@ -588,7 +544,7 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
             virt_size: vsize,
             characteristics: s.characteristics,
             buf,
-            dll_sec_idx: Some(i),
+            dll_sec_idx: i,
         });
 
         // Advance the expected-VA pointer: section-aligned end of this section.
@@ -651,12 +607,11 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
 
                     if rel_type == IMAGE_REL_BASED_HIGHLOW {
                         let target_rva = blk.VirtualAddress + offset;
-                        // Find which real (non-filler) section buffer contains this RVA.
+                        // Find which real section buffer contains this RVA.
                         // Relocations targeting skipped sections (e.g. .reloc self-
                         // references) are harmless to ignore.
                         let found = entries.iter_mut().find_map(|e| {
-                            let sec_idx = e.dll_sec_idx?;
-                            let s = &dll_pe.sections[sec_idx];
+                            let s = &dll_pe.sections[e.dll_sec_idx];
                             let va = s.virtual_address;
                             let len = s.virtual_size.max(s.raw_size) as usize;
                             if target_rva >= va && (target_rva - va) as usize + 4 <= len {
@@ -687,8 +642,7 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     //  Patch inner_entry with the original EXE entry VA 
     let orig_entry_va = exe_pe.image_base.wrapping_add(original_entry_rva);
     let found_entry = entries.iter_mut().find_map(|e| {
-        let sec_idx = e.dll_sec_idx?;
-        let s = &dll_pe.sections[sec_idx];
+        let s = &dll_pe.sections[e.dll_sec_idx];
         let va = s.virtual_address;
         let len = s.virtual_size.max(s.raw_size) as usize;
         if inner_entry_rva >= va && (inner_entry_rva - va) as usize + 4 <= len {
@@ -752,6 +706,18 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
 
     //  Update EXE headers 
 
+    // If the first DLL section doesn't start at VA 0 in the DLL image,
+    // extend the last EXE section's VirtualSize to cover the gap between
+    // the end of the EXE sections and the start of the first DLL section.
+    if extend_last_exe_vsize_by > 0 {
+        let last_sec_idx = exe_pe.sections.len() - 1;
+        let sh_off = exe_pe.shdrs_base() + last_sec_idx * sec_hdr_sz;
+        let last_sec = &exe_pe.sections[last_sec_idx];
+        // New VirtualSize covers [last_sec.virtual_address, new_rva + extend).
+        let new_vsize = new_rva + extend_last_exe_vsize_by - last_sec.virtual_address;
+        w32(&mut out, sh_off + offset_of!(IMAGE_SECTION_HEADER, Misc), new_vsize);
+    }
+
     // New entry point: DLL entry within the new section region.
     w32(
         &mut out,
@@ -759,7 +725,7 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
         new_rva + dll_entry_rva,
     );
 
-    // New SizeOfImage: virtual end of the last new section (including fillers).
+    // New SizeOfImage: virtual end of the last new section.
     let new_size_of_image = entries
         .iter()
         .map(|e| e.virt_addr + e.virt_size)
