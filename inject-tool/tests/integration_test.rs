@@ -84,6 +84,20 @@ fn build_target_exe(vcvarsall: &Path, work_dir: &Path) -> PathBuf {
     work_dir.join("target.exe")
 }
 
+/// Compile `tests/c/cmdline_target.c` into `<work_dir>/cmdline_target.exe` (no CRT, x86).
+fn build_cmdline_target_exe(vcvarsall: &Path, work_dir: &Path) -> PathBuf {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/c/cmdline_target.c");
+    fs::copy(&src, work_dir.join("cmdline_target.c")).expect("copy cmdline_target.c");
+    msvc_x86(
+        vcvarsall,
+        work_dir,
+        "cl /nologo /W3 /Ox /GS- /c cmdline_target.c && \
+         link /NODEFAULTLIB /ENTRY:entry /SUBSYSTEM:CONSOLE /DYNAMICBASE:NO \
+              /OUT:cmdline_target.exe cmdline_target.obj kernel32.lib",
+    );
+    work_dir.join("cmdline_target.exe")
+}
+
 /// Build `stub-dll` (Rust no_std, i686-pc-windows-msvc) and return the DLL path.
 fn build_stub_dll() -> PathBuf {
     // CARGO_MANIFEST_DIR = inject-tool/  →  parent = workspace root
@@ -161,6 +175,75 @@ fn test_injection_pipeline() {
         stdout.as_ref(),
         "original\n",
         "unexpected stdout from patched.exe: {:?}",
+        stdout,
+    );
+}
+
+/// Parameter-injection test:
+///
+/// 1. Compile `tests/c/cmdline_target.c` → 32-bit no-CRT `cmdline_target.exe`
+///    (prints its own command line to stdout then exits).
+/// 2. Build `stub-dll` → 32-bit no_std `stub.dll`.
+/// 3. Run `inject-tool cmdline_target.exe stub.dll patched_cmdline.exe`.
+/// 4. Run `patched_cmdline.exe /UPDATE` and assert that stub.dll replaced
+///    the argument with ` /SP- /SILENT /NOICONS /CURRENTUSER`.
+#[test]
+fn test_parameter_injection() {
+    // Skip gracefully when MSVC build tools are absent.
+    let vcvarsall = match find_vcvarsall() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: MSVC vcvarsall.bat not found");
+            return;
+        }
+    };
+
+    let work_dir = std::env::temp_dir().join("inject_tool_test_cmdline");
+    fs::create_dir_all(&work_dir).unwrap();
+
+    let inject_tool       = find_inject_tool();
+    let cmdline_target    = build_cmdline_target_exe(&vcvarsall, &work_dir);
+    let stub_dll          = build_stub_dll();
+    let patched_cmdline   = work_dir.join("patched_cmdline.exe");
+
+    // ── inject ───────────────────────────────────────────────────────────────
+    let inject_out = Command::new(&inject_tool)
+        .args([&cmdline_target, &stub_dll, &patched_cmdline])
+        .output()
+        .expect("run inject-tool");
+
+    assert!(
+        inject_out.status.success(),
+        "inject-tool failed:\nSTDOUT: {}\nSTDERR: {}",
+        String::from_utf8_lossy(&inject_out.stdout),
+        String::from_utf8_lossy(&inject_out.stderr),
+    );
+
+    // ── run with /UPDATE ─────────────────────────────────────────────────────
+    // stub.dll replaces "/UPDATE" with " /SP- /SILENT /NOICONS /CURRENTUSER".
+    let run = Command::new(&patched_cmdline)
+        .arg("/UPDATE")
+        .output()
+        .expect("run patched_cmdline.exe");
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "patched_cmdline.exe non-zero exit\nstdout: {:?}\nstderr: {:?}",
+        stdout,
+        stderr,
+    );
+    assert!(
+        !stdout.contains("/UPDATE"),
+        "command line still contains /UPDATE (not replaced): {:?}",
+        stdout,
+    );
+    assert!(
+        stdout.contains("/SP-"),
+        "command line missing /SP- (replacement not applied): {:?}",
         stdout,
     );
 }
