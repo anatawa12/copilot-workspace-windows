@@ -1,0 +1,14 @@
+[build]
+target = "i686-pc-windows-msvc"
+
+[target.i686-pc-windows-msvc]
+# /ENTRY:DllMainCRTStartup — raw entry point (no CRT startup).
+# /NODEFAULTLIB            — no CRT DLL dependency; we supply all helpers.
+# /SAFESEH:NO              — disable safe-SEH table requirement.
+# kernel32.lib             — explicit link for Win32 API.
+rustflags = [
+    "-C", "link-arg=/ENTRY:DllMainCRTStartup",
+    "-C", "link-arg=/NODEFAULTLIB",
+    "-C", "link-arg=/SAFESEH:NO",
+    "-C", "link-arg=kernel32.lib",
+]
