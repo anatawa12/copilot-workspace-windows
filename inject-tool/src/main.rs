@@ -574,13 +574,38 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
 
-    // ── Redirect DLL IAT entries to EXE IAT ───────────────────────────────
-    // Each DLL IAT slot is overwritten with the VA of the matching EXE IAT slot.
-    // At runtime the EXE's IAT slots hold the real function addresses (filled by
-    // the Windows loader), so DLL import calls indirect through them correctly.
-    for (dll_name, func_name, dll_iat_rva) in &dll_imports {
+    // ── Redirect DLL IAT entries via JMP thunks ────────────────────────────
+    //
+    // The DLL's code does  `call dword ptr [dll_iat_slot]`  (single-indirect).
+    // That slot must hold a *callable* address.  We cannot store the EXE's IAT
+    // data VA directly there because the IAT is filled with function pointers by
+    // the loader and executing those bytes as code would crash.
+    //
+    // Instead, for each import we write a 6-byte JMP thunk in the .patch section
+    // immediately after the DLL image:
+    //
+    //   FF 25 [exe_iat_va]   →   jmp dword ptr [exe_iat_va]
+    //
+    // Then point the DLL's IAT slot at the thunk VA.  At runtime:
+    //   call [dll_iat_slot]  →  call thunk  →  jmp [exe_iat_va]
+    //                                         →  jumps to the real function
+    //
+    // The thunk area is appended after the DLL image within the .patch section.
+    let thunk_base_rva = new_rva + dll_img_size as u32;
+
+    let mut thunk_data: Vec<u8> = Vec::with_capacity(dll_imports.len() * 6);
+
+    for (i, (dll_name, func_name, dll_iat_rva)) in dll_imports.iter().enumerate() {
         let exe_iat_rva = exe_imports[&(dll_name.clone(), func_name.clone())];
         let exe_iat_va = exe_pe.image_base.wrapping_add(exe_iat_rva);
+
+        // VA of the thunk for this import
+        let thunk_va = exe_pe
+            .image_base
+            .wrapping_add(thunk_base_rva)
+            .wrapping_add((i * 6) as u32);
+
+        // Point DLL's IAT slot at the thunk
         let idx = *dll_iat_rva as usize;
         if idx + 4 > dll_image.len() {
             return Err(format!(
@@ -588,7 +613,12 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
                 dll_iat_rva
             ));
         }
-        dll_image[idx..idx + 4].copy_from_slice(&exe_iat_va.to_le_bytes());
+        dll_image[idx..idx + 4].copy_from_slice(&thunk_va.to_le_bytes());
+
+        // Write the 6-byte JMP thunk: FF 25 [exe_iat_va LE]
+        thunk_data.push(0xFF);
+        thunk_data.push(0x25);
+        thunk_data.extend_from_slice(&exe_iat_va.to_le_bytes());
     }
 
     // ── Disable the embedded DLL's import directory ────────────────────────
@@ -623,7 +653,8 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     // ── Build the output file ──────────────────────────────────────────────
-    let raw_size_aligned = align_up(dll_img_size as u32, exe_pe.file_align);
+    let patch_content_size = dll_img_size + thunk_data.len();
+    let raw_size_aligned = align_up(patch_content_size as u32, exe_pe.file_align);
     let required_len = new_raw as usize + raw_size_aligned as usize;
     let mut out = exe_data.to_vec();
     if required_len > out.len() {
@@ -632,6 +663,11 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
 
     // Write DLL memory image into the new section's raw data area
     out[new_raw as usize..new_raw as usize + dll_img_size].copy_from_slice(&dll_image);
+    // Write JMP thunks immediately after the DLL image
+    if !thunk_data.is_empty() {
+        let thunk_off = new_raw as usize + dll_img_size;
+        out[thunk_off..thunk_off + thunk_data.len()].copy_from_slice(&thunk_data);
+    }
 
     // ── Update EXE headers ─────────────────────────────────────────────────
 
@@ -639,7 +675,7 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     w32(&mut out, exe_pe.oh + 16, new_rva + dll_entry_rva);
 
     // New SizeOfImage
-    let new_size_of_image = align_up(new_rva + dll_img_size as u32, exe_pe.sec_align);
+    let new_size_of_image = align_up(new_rva + patch_content_size as u32, exe_pe.sec_align);
     w32(&mut out, exe_pe.oh + 56, new_size_of_image);
 
     // Increment NumberOfSections
@@ -652,7 +688,7 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     const SEC_READ: u32 = 0x4000_0000; // IMAGE_SCN_MEM_READ
 
     out[new_sh_off..new_sh_off + 8].copy_from_slice(b".patch\0\0");
-    w32(&mut out, new_sh_off + 8, dll_img_size as u32); // VirtualSize
+    w32(&mut out, new_sh_off + 8, patch_content_size as u32); // VirtualSize
     w32(&mut out, new_sh_off + 12, new_rva); // VirtualAddress
     w32(&mut out, new_sh_off + 16, raw_size_aligned); // SizeOfRawData
     w32(&mut out, new_sh_off + 20, new_raw); // PointerToRawData
