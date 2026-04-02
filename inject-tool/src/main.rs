@@ -547,10 +547,29 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     let new_rva = align_up(last.end_rva(), exe_pe.sec_align);
     let new_raw = align_up(last.raw_ptr + last.raw_size, exe_pe.file_align);
 
-    //  Apply DLL base relocations 
+    //  Apply DLL base relocations and redirect IAT references
     // The DLL will reside at virtual address: exe_image_base + new_rva
     let load_base = exe_pe.image_base.wrapping_add(new_rva);
     let delta = (load_base as i64) - (dll_image_base as i64);
+
+    // Build a map: dll_iat_va -> exe_iat_va for every import.
+    //
+    // In the DLL on-disk image, code that calls an imported function via IAT
+    // uses an absolute VA operand equal to `dll_image_base + dll_iat_rva`.
+    // The linker records every such location in the .reloc section as an
+    // IMAGE_REL_BASED_HIGHLOW entry.  We detect these entries during the
+    // relocation pass and replace the absolute address directly with the
+    // corresponding EXE IAT VA (exe_image_base + exe_iat_rva), eliminating
+    // the need for any appended JMP thunks.
+    let iat_redirect: HashMap<u32, u32> = dll_imports
+        .iter()
+        .map(|(dll_name, func_name, dll_iat_rva)| {
+            let exe_iat_rva = exe_imports[&(dll_name.clone(), func_name.clone())];
+            let dll_iat_va = dll_image_base.wrapping_add(*dll_iat_rva);
+            let exe_iat_va = exe_pe.image_base.wrapping_add(exe_iat_rva);
+            (dll_iat_va, exe_iat_va)
+        })
+        .collect();
 
     {
         let dir = dll_pe.ddir(DDIR_BASERELOC);
@@ -593,52 +612,20 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
                         let old = u32::from_le_bytes(
                             dll_image[idx..idx + 4].try_into().unwrap(),
                         );
-                        let new_val = (old as i64 + delta) as u32;
+                        // If this absolute address references a DLL IAT slot,
+                        // replace it with the corresponding EXE IAT VA.
+                        // Otherwise apply the standard load-time delta.
+                        let new_val = if let Some(&exe_iat_va) = iat_redirect.get(&old) {
+                            exe_iat_va
+                        } else {
+                            (old as i64 + delta) as u32
+                        };
                         dll_image[idx..idx + 4].copy_from_slice(&new_val.to_le_bytes());
                     }
                 }
                 pos += blk.SizeOfBlock as usize;
             }
         }
-    }
-
-    //  Redirect DLL IAT entries via JMP thunks ─
-    //
-    // The DLL's code does  `call dword ptr [dll_iat_slot]`  (single-indirect).
-    // That slot must hold a *callable* address.  We cannot store the EXE's IAT
-    // data VA directly there because the IAT holds function addresses, not code.
-    //
-    // Instead we write a 6-byte JMP thunk:   FF 25 [exe_iat_va]
-    //   call [dll_iat_slot]    call thunk    jmp [exe_iat_va]    real fn
-    //
-    // Thunks are appended after the DLL image within the .patch section.
-    let thunk_base_rva = new_rva + dll_img_size as u32;
-    let mut thunk_data: Vec<u8> = Vec::with_capacity(dll_imports.len() * 6);
-
-    for (i, (dll_name, func_name, dll_iat_rva)) in dll_imports.iter().enumerate() {
-        let exe_iat_rva = exe_imports[&(dll_name.clone(), func_name.clone())];
-        let exe_iat_va = exe_pe.image_base.wrapping_add(exe_iat_rva);
-
-        // VA of this thunk within the patched EXE's address space
-        let thunk_va = exe_pe
-            .image_base
-            .wrapping_add(thunk_base_rva)
-            .wrapping_add((i * 6) as u32);
-
-        // Point DLL's IAT slot at the thunk
-        let idx = *dll_iat_rva as usize;
-        if idx + 4 > dll_image.len() {
-            return Err(format!(
-                "DLL IAT entry RVA 0x{:08X} out of DLL image",
-                dll_iat_rva
-            ));
-        }
-        dll_image[idx..idx + 4].copy_from_slice(&thunk_va.to_le_bytes());
-
-        // Write the 6-byte JMP thunk: FF 25 [exe_iat_va LE]
-        thunk_data.push(0xFF);
-        thunk_data.push(0x25);
-        thunk_data.extend_from_slice(&exe_iat_va.to_le_bytes());
     }
 
     //  Disable the embedded DLL's import directory ─
@@ -676,7 +663,7 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     //  Build the output file ─
-    let patch_content_size = dll_img_size + thunk_data.len();
+    let patch_content_size = dll_img_size;
     let raw_size_aligned = align_up(patch_content_size as u32, exe_pe.file_align);
     let required_len = new_raw as usize + raw_size_aligned as usize;
     let mut out = exe_data.to_vec();
@@ -686,12 +673,6 @@ fn inject(exe_data: &[u8], dll_data: &[u8]) -> Result<Vec<u8>, String> {
 
     // Write DLL memory image into the new section's raw data area
     out[new_raw as usize..new_raw as usize + dll_img_size].copy_from_slice(&dll_image);
-    // Write JMP thunks immediately after the DLL image
-    if !thunk_data.is_empty() {
-        let thunk_off = new_raw as usize + dll_img_size;
-        out[thunk_off..thunk_off + thunk_data.len()].copy_from_slice(&thunk_data);
-    }
-
     //  Update EXE headers 
 
     // New entry point: DLL entry within the new section
