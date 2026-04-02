@@ -137,6 +137,128 @@ const unsafe fn wcslen(mut s: *const u16) -> usize {
     len
 }
 
+// ─── Module-list helpers ──────────────────────────────────────────────────────
+
+/// Case-insensitive compare of a UTF-16 module base name (length in bytes)
+/// against an ASCII lowercase reference string.
+unsafe fn wname_eq_ascii(name: *const u16, name_bytes: u16, ascii: &[u8]) -> bool {
+    let chars = (name_bytes / 2) as usize;
+    if chars != ascii.len() {
+        return false;
+    }
+    for i in 0..chars {
+        let wc = *name.add(i);
+        let lc = if wc >= b'A' as u16 && wc <= b'Z' as u16 {
+            wc + 32
+        } else {
+            wc
+        };
+        if lc != ascii[i] as u16 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Scan all writable, non-executable sections of the loaded PE image at `base`
+/// for 4-byte-aligned values equal to `old_ptr as u32` and replace each with
+/// `new_ptr as u32`.
+///
+/// Used to update the `GetCommandLineW` cache pointer stored inside
+/// kernel32.dll / kernelbase.dll.  The false-positive risk is negligible: the
+/// old command-line buffer is a process-specific heap address that is
+/// effectively unique within the module's writable data.
+unsafe fn scan_and_replace_ptr(base: *const u8, old_ptr: *const u16, new_ptr: *const u16) {
+    // Verify MZ signature.
+    if *(base as *const u16) != 0x5A4D {
+        return;
+    }
+    let e_lfanew = *((base as usize + 0x3C) as *const u32) as usize;
+    // Verify PE\0\0 signature.
+    if *((base as usize + e_lfanew) as *const u32) != 0x0000_4550 {
+        return;
+    }
+
+    // IMAGE_FILE_HEADER starts 4 bytes after the PE signature.
+    let fh = e_lfanew + 4;
+    let num_secs = *((base as usize + fh + 2) as *const u16) as usize;
+    let size_of_opt = *((base as usize + fh + 16) as *const u16) as usize;
+    // Section headers immediately follow the optional header.
+    let shdrs = base as usize + fh + 20 + size_of_opt;
+
+    // IMAGE_SECTION_HEADER field offsets:
+    //   +0x08  Misc.VirtualSize
+    //   +0x0C  VirtualAddress
+    //   +0x24  Characteristics
+    const SHDR: usize = 40;
+    const SCN_WRITE: u32 = 0x8000_0000;
+    const SCN_EXEC: u32 = 0x2000_0000;
+
+    for i in 0..num_secs {
+        let sh = shdrs + i * SHDR;
+        let virt_size = *((sh + 8) as *const u32) as usize;
+        let virt_addr = *((sh + 12) as *const u32) as usize;
+        let characteristics = *((sh + 36) as *const u32);
+
+        if characteristics & SCN_WRITE == 0 || characteristics & SCN_EXEC != 0 {
+            continue;
+        }
+
+        let sec_start = base as usize + virt_addr;
+        let sec_end = sec_start + virt_size;
+        let mut addr = sec_start;
+        while addr + 4 <= sec_end {
+            if *(addr as *const u32) == old_ptr as u32 {
+                *(addr as *mut u32) = new_ptr as u32;
+            }
+            addr += 4;
+        }
+    }
+}
+
+/// Walk the PEB InLoadOrder module list and call `scan_and_replace_ptr` on
+/// every loaded module whose base name (case-insensitive) is "kernel32.dll"
+/// or "kernelbase.dll".
+///
+/// `GetCommandLineW` caches the command-line buffer pointer during process
+/// initialisation.  Patching PEB.ProcessParameters.CommandLine.Buffer alone is
+/// insufficient when a new heap buffer is allocated; this function updates the
+/// kernel-side cache so that `GetCommandLineW` returns the new buffer.
+unsafe fn patch_kernel_cmdline_cache(old_ptr: *const u16, new_ptr: *const u16) {
+    let peb: usize;
+    core::arch::asm!(
+        "mov {:e}, dword ptr fs:[0x30]",
+        out(reg) peb,
+        options(nostack, nomem, preserves_flags),
+    );
+
+    // PEB+0x0C → Ldr (*PEB_LDR_DATA)
+    let ldr = *((peb + 0x0C) as *const usize);
+
+    // PEB_LDR_DATA+0x0C → InLoadOrderModuleList (LIST_ENTRY)
+    let list_head = ldr + 0x0C;
+    let mut flink = *(list_head as *const usize);
+
+    while flink != list_head {
+        // LDR_DATA_TABLE_ENTRY offsets (x86 / 32-bit):
+        //   +0x018  DllBase
+        //   +0x02C  BaseDllName.Length  (u16, in bytes)
+        //   +0x030  BaseDllName.Buffer  (*u16)
+        let dll_base = *((flink + 0x18) as *const usize);
+        let name_len = *((flink + 0x2C) as *const u16);
+        let name_buf = *((flink + 0x30) as *const *const u16);
+
+        if dll_base != 0
+            && (wname_eq_ascii(name_buf, name_len, b"kernel32.dll")
+                || wname_eq_ascii(name_buf, name_len, b"kernelbase.dll"))
+        {
+            scan_and_replace_ptr(dll_base as *const u8, old_ptr, new_ptr);
+        }
+
+        flink = *(flink as *const usize); // follow Flink
+    }
+}
+
 // ─── Minimal PEB / process-parameters overlay (x86) ─────────────────────────
 //
 // We only map the fields we need:
@@ -220,7 +342,8 @@ static EXPORT_DRECTVE: [u8; 25] = *b" /EXPORT:inner_entry,DATA";
 unsafe extern "system" fn DllMainCRTStartup() -> BOOL {
     let pp = get_process_params();
 
-    let command_line = WCstr::from_cstr((*pp).cmd_buffer as *const u16);
+    let old_cmd_buf = (*pp).cmd_buffer as *const u16;
+    let command_line = WCstr::from_cstr(old_cmd_buf);
 
     // Locate where the parameters begin (after the executable path).
     let params_start = if command_line.starts_with(wc!("\"")) {
@@ -259,6 +382,11 @@ unsafe extern "system" fn DllMainCRTStartup() -> BOOL {
                 (*pp).cmd_length     = (new_cap * 2) as u16;
                 (*pp).cmd_max_length = ((new_cap + 1) * 2) as u16;
                 (*pp).cmd_buffer     = mem;
+                // kernel32.dll / kernelbase.dll cache the command-line buffer
+                // pointer set during process init.  Patching the PEB alone is
+                // not enough; update the cached pointer so GetCommandLineW
+                // returns the new buffer.
+                patch_kernel_cmdline_cache(old_cmd_buf, mem as *const u16);
             }
         }
     }
